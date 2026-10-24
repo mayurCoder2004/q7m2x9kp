@@ -1,0 +1,18 @@
+# Render Blueprint for the Windwise backend (Docker).
+# Render -> New -> Blueprint -> select this repository.
+services:
+  - type: web
+    name: windwise-api
+    runtime: docker
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ELEXON_BASE_URL
+        value: https://data.elexon.co.uk/bmrs/api/v1
+      - key: CACHE_TTL_SECONDS
+        value: "900"
+      # Set to the deployed frontend origin, e.g. https://windwise.vercel.app
+      - key: FRONTEND_ORIGINS
+        sync: false

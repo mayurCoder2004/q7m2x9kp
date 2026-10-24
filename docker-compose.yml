@@ -6,11 +6,18 @@ services:
     environment:
       - ELEXON_BASE_URL=https://data.elexon.co.uk/bmrs/api/v1
       - FRONTEND_ORIGINS=http://localhost:5173
+      - CACHE_TTL_SECONDS=900
+    restart: unless-stopped
+
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        # The browser calls the API directly, so this is the host-side URL.
+        VITE_API_URL: http://localhost:8000
     ports:
-      - "5173:5173"
-    environment:
-      - VITE_API_URL=http://localhost:8000
+      - "5173:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
