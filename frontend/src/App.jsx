@@ -77,7 +77,7 @@ export default function App() {
           <label className={scope === 'day' ? 'on' : ''}><input type="radio" name="scope" value="day" checked={scope === 'day'} onChange={() => setScope('day')}/>Single day</label>
           <label className={scope === 'month' ? 'on' : ''}><input type="radio" name="scope" value="month" checked={scope === 'month'} onChange={() => setScope('month')}/>Full month</label>
         </div></fieldset>
-        <label>Delivery date (UK)<input type="date" value={day} min={FIRST_DAY} max={LAST_DAY} disabled={scope === 'month'} aria-invalid={!dayValid} onChange={(e) => setDay(e.target.value)}/></label>
+        <label><span>Delivery date (UK) <span className="filter-badge">Jan 2026 only</span></span><input type="date" value={day} min={FIRST_DAY} max={LAST_DAY} disabled={scope === 'month'} aria-invalid={!dayValid} title="Analysis is restricted to January 2026 delivery dates (1–31 Jan 2026)" onChange={(e) => setDay(e.target.value)}/></label>
         <label>Decision cutoff, day before (UK time)<select value={cutoff} onChange={(e) => setCutoff(e.target.value)}>{CUTOFFS.map((t) => <option key={t} value={t}>{t}</option>)}</select></label>
         <button type="submit" className="primary" disabled={loading || !dayValid}><RefreshCw className={loading ? 'spin' : ''} size={16}/> {loading ? 'Loading' : 'Run analysis'}</button>
         {!dayValid && <p className="field-error" role="alert">Choose a delivery date between 1 and 31 January 2026.</p>}

@@ -16,6 +16,7 @@ a.nav-item{text-decoration:none;margin-bottom:2px}a.nav-item:hover{background:#1
 .filters input:disabled{background:#f4f7fb;color:#9aa4b3}
 .filters input[aria-invalid=true]{border-color:#dc2626}
 .field-error{flex-basis:100%;margin:0;color:#b91c1c;font-size:11px}
+.filter-badge{font-size:9px;font-weight:600;background:#e2e8f0;color:#475569;padding:2px 7px;border-radius:10px;letter-spacing:0;margin-left:5px;display:inline-block;vertical-align:middle;text-transform:none}
 .chart-small{height:220px}
 .lower-grid{margin-bottom:18px}
 .summary-list{margin:0;padding-left:18px;font-size:12.5px;line-height:1.7;color:#3d4a60}.summary-list li{margin-bottom:6px}

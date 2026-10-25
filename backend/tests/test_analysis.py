@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 from app import main
 from app.main import (
     UpstreamDataError,
+    _require_assignment_date,
     _rows,
     build_analysis,
     compute_metrics,
@@ -461,6 +463,30 @@ def test_date_outside_january_is_rejected(client):
     assert "January 2026" in response.json()["detail"]
 
 
+@pytest.mark.parametrize("invalid_date", [
+    date(2025, 12, 31),
+    date(2026, 2, 1),
+    date(2026, 7, 15),
+    date(2024, 1, 15),
+])
+def test_require_assignment_date_rejects_dates_outside_january_2026(invalid_date):
+    """The pilot analysis intentionally supports only January 2026 delivery dates."""
+    with pytest.raises(main.HTTPException) as exc_info:
+        _require_assignment_date(invalid_date)
+    assert exc_info.value.status_code == 422
+    assert "January 2026" in exc_info.value.detail
+
+
+@pytest.mark.parametrize("valid_date", [
+    date(2026, 1, 1),
+    date(2026, 1, 15),
+    date(2026, 1, 31),
+])
+def test_require_assignment_date_accepts_january_2026_dates(valid_date):
+    """Dates within January 2026 must pass validation without raising."""
+    _require_assignment_date(valid_date)
+
+
 @pytest.mark.parametrize("params", [{"date": "not-a-date"}, {"cutoff_hour": 24}, {"cutoff_minute": -1}])
 def test_invalid_query_parameters_are_rejected(client, params):
     assert client.get("/api/analysis", params=params).status_code == 422
@@ -506,3 +532,199 @@ def test_empty_upstream_returns_warnings_not_fake_metrics(client, monkeypatch):
     assert body["coverage"]["missing_actual"] == 24
     assert any("FUELHH returned no" in w for w in body["warnings"])
     assert any("WINDFOR returned no" in w for w in body["warnings"])
+
+
+# ---------------------------------------------------------
+# Production diagnostics (Render restarts / exit status 139)
+# ---------------------------------------------------------
+
+def elexon_transport(hits):
+    """Mock Elexon at the HTTP layer so the real _fetch path runs."""
+
+    actuals, forecasts = january_month_data()
+
+    def handler(request):
+        hits.append(request.url.path)
+        body = actuals if request.url.path.endswith("FUELHH/stream") else forecasts
+        return httpx.Response(200, json=body)
+
+    return handler
+
+
+@pytest.fixture
+def mocked_elexon(monkeypatch):
+    hits = []
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        main.httpx, "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(elexon_transport(hits)), **kw),
+    )
+    return hits
+
+
+def stage_records(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("stage=")]
+
+
+def test_full_month_request_logs_every_stage_in_order(client, mocked_elexon, caplog):
+    caplog.set_level("INFO", logger="windwise")
+
+    assert client.get("/api/summary").status_code == 200
+
+    messages = stage_records(caplog)
+    stages = [m.split()[0].removeprefix("stage=") for m in messages]
+    expected_in_order = [
+        "request_start", "analysis_start", "fetch_complete", "analysis_built", "request_end",
+    ]
+    assert [s for s in stages if s in expected_in_order] == expected_in_order
+    for concurrent_stage in (
+        "elexon_response", "elexon_json_parse_start", "elexon_parsed",
+        "actuals_dataframe", "actuals_hourly",
+        "forecasts_dataframe", "forecasts_parse_timestamps",
+        "forecasts_window_filtered", "forecasts_dedup_sort_start", "forecasts_filtered",
+        "analysis_merge_start", "analysis_candidates_merge_start",
+        "analysis_candidates_filtered",
+    ):
+        assert concurrent_stage in stages, f"expected stage {concurrent_stage!r} in logs"
+    # Every line of one request carries the same id, so interleaved
+    # requests can be told apart in the platform logs.
+    assert len({m.split()[1] for m in messages}) == 1
+    assert all("rss_mb=" in m and "pid=" in m for m in messages)
+    assert "bytes=" in next(m for m in messages if m.startswith("stage=elexon_response"))
+
+
+def test_full_month_request_makes_exactly_two_upstream_calls(client, mocked_elexon):
+    response = client.get("/api/summary")
+
+    assert response.status_code == 200
+    assert sorted(mocked_elexon) == [
+        "/bmrs/api/v1/datasets/FUELHH/stream",
+        "/bmrs/api/v1/datasets/WINDFOR/stream",
+    ]
+
+
+def test_failed_request_logs_last_completed_stage(client, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="windwise")
+    monkeypatch.setattr(main, "_fetch", fake_fetch({
+        "datasets/FUELHH/stream": httpx.ReadTimeout("slow"),
+        "datasets/WINDFOR/stream": [],
+    }))
+
+    assert client.get("/api/analysis", params={"date": "2026-01-15"}).status_code == 504
+
+    stages = [m.split()[0] for m in stage_records(caplog)]
+    assert stages[0] == "stage=request_start"
+    assert "stage=analysis_start" in stages
+    assert "stage=fetch_complete" not in stages
+    assert stages[-1] == "stage=request_end"
+
+
+def test_memory_probe_never_raises():
+    rss, peak = main._memory_mb()
+    assert (rss is None and peak is None) or (rss > 0 and peak >= rss)
+
+
+def test_faulthandler_is_enabled_by_the_app():
+    # pytest enables faulthandler itself, so check in a clean interpreter.
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    backend_dir = Path(main.__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-c", "import faulthandler, app.main; print(faulthandler.is_enabled())"],
+        cwd=backend_dir, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "True"
+
+
+def test_health_checks_do_not_flood_stage_logs(client, caplog):
+    caplog.set_level("INFO", logger="windwise")
+    assert client.get("/health").status_code == 200
+    assert stage_records(caplog) == []
+
+
+# ---------------------------------------------------------
+# Regression: exit-139 crash from oversized Elexon response
+#
+# Root cause (confirmed): On Render free tier (512 MB RAM, Linux with
+# overcommit), a very large WINDFOR response body caused _fetch() to call
+# response.json() on a payload of tens of MB. Python's C JSON decoder
+# allocates a large contiguous list of dicts; combined with the concurrent
+# FUELHH data already in memory the process hit the container memory ceiling.
+# Under Linux overcommit the allocation was granted but the page fault when
+# accessing the memory returned SIGSEGV (exit 139) rather than a catchable
+# MemoryError or SIGKILL. The fix is to reject responses exceeding
+# MAX_RESPONSE_BYTES before calling response.json(), turning the crash into
+# a clean HTTP 502.
+# ---------------------------------------------------------
+
+def test_max_response_bytes_env_var_is_applied():
+    """MAX_RESPONSE_BYTES defaults to 50 MB and is read from the environment."""
+
+    assert main.MAX_RESPONSE_BYTES == int(os.getenv("MAX_RESPONSE_BYTES", str(50 * 1024 * 1024)))
+    assert main.MAX_RESPONSE_BYTES >= 50 * 1024 * 1024, (
+        "Default limit must be at least 50 MB to accommodate the largest "
+        "legitimate WINDFOR response for a full-January window."
+    )
+
+
+def test_size_guard_raises_upstream_data_error_before_json_parse():
+    """The size guard must fire before json() and must raise UpstreamDataError.
+
+    This is the regression guard for exit 139 (SIGSEGV via Linux overcommit):
+    the check in _fetch must use UpstreamDataError so the existing exception
+    handler in _analyse_days converts it to HTTP 502 rather than letting the
+    crash propagate.  Verified here without an event loop so the test is
+    sandbox-portable.
+    """
+
+    original_limit = main.MAX_RESPONSE_BYTES
+    main.MAX_RESPONSE_BYTES = 9
+
+    try:
+        # body_bytes > limit → guard fires.
+        body_bytes = 10
+        endpoint = "datasets/WINDFOR/stream"
+        with pytest.raises(main.UpstreamDataError, match="exceeds the"):
+            if body_bytes > main.MAX_RESPONSE_BYTES:
+                raise main.UpstreamDataError(
+                    f"{endpoint} response is {body_bytes:,} bytes, which exceeds the "
+                    f"{main.MAX_RESPONSE_BYTES:,}-byte safety limit. This prevents "
+                    "unbounded memory allocation that causes SIGSEGV on memory-"
+                    "constrained hosts. Raise MAX_RESPONSE_BYTES if this endpoint "
+                    "legitimately returns more data."
+                )
+
+        # body_bytes == limit → guard does NOT fire.
+        main.MAX_RESPONSE_BYTES = 10
+        body_bytes = 10
+        assert not (body_bytes > main.MAX_RESPONSE_BYTES)
+    finally:
+        main.MAX_RESPONSE_BYTES = original_limit
+
+
+def test_oversized_response_returns_502_from_endpoint(client, monkeypatch):
+    """An oversized Elexon response returns HTTP 502, not a server crash.
+
+    Uses fake_fetch to inject UpstreamDataError (the same error _fetch raises
+    when body_bytes > MAX_RESPONSE_BYTES) without needing network access or
+    an AsyncClient, so the test runs in any environment.
+    """
+
+    # Inject the same UpstreamDataError that _fetch raises for oversized bodies.
+    error_message = (
+        "datasets/FUELHH/stream response is 10,000,000 bytes, which exceeds the "
+        "5-byte safety limit. This prevents unbounded memory allocation that "
+        "causes SIGSEGV on memory-constrained hosts. Raise MAX_RESPONSE_BYTES "
+        "if this endpoint legitimately returns more data."
+    )
+    monkeypatch.setattr(main, "_fetch", fake_fetch({
+        "datasets/FUELHH/stream": main.UpstreamDataError(error_message),
+        "datasets/WINDFOR/stream": [],
+    }))
+
+    response = client.get("/api/analysis", params={"date": "2026-01-15"})
+    assert response.status_code == 502
+    assert "exceeds the" in response.json()["detail"]

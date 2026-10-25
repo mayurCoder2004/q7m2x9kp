@@ -18,10 +18,14 @@ describe('formatting', () => {
   });
   it('restricts delivery dates to January 2026', () => {
     expect(isJanuary2026('2026-01-01')).toBe(true);
+    expect(isJanuary2026('2026-01-15')).toBe(true);
     expect(isJanuary2026('2026-01-31')).toBe(true);
     expect(isJanuary2026('2025-12-31')).toBe(false);
     expect(isJanuary2026('2026-02-01')).toBe(false);
+    expect(isJanuary2026('2026-01-00')).toBe(false);
+    expect(isJanuary2026('2026-01-32')).toBe(false);
     expect(isJanuary2026('')).toBe(false);
+    expect(isJanuary2026('not-a-date')).toBe(false);
   });
 });
 

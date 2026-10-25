@@ -59,6 +59,8 @@ describe('App', () => {
     const input = screen.getByLabelText(/delivery date/i);
     expect(input.min).toBe('2026-01-01');
     expect(input.max).toBe('2026-01-31');
+    expect(input.title).toContain('January 2026');
+    expect(screen.getByText(/Jan 2026 only/i)).toBeTruthy();
 
     fireEvent.change(input, { target: { value: '2026-02-03' } });
     expect(screen.getByText(/Choose a delivery date between/)).toBeTruthy();

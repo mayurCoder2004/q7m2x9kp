@@ -6,10 +6,15 @@ day-ahead decision cutoff.
 """
 
 import asyncio
+import contextvars
 from datetime import date, datetime, time, timedelta, timezone
+import faulthandler
+import importlib.util
+import itertools
 import logging
 import os
-from time import monotonic
+import platform
+from time import monotonic, perf_counter
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -32,6 +37,15 @@ BASE_URL = os.getenv(
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("ELEXON_TIMEOUT_SECONDS", "45"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
 
+# Reject Elexon responses larger than this before JSON-parsing them. An
+# unexpectedly large payload would otherwise cause Python's C JSON decoder to
+# allocate several hundred MB of objects at once, which on memory-constrained
+# hosts (e.g. Render free tier, 512 MB) triggers a SIGSEGV via the Linux
+# overcommit path rather than a clean MemoryError. 50 MB is well above the
+# largest legitimate WINDFOR response for a 33-day publish window (~3-5 MB
+# for ~15 000 records) while still safely below the 512 MB Render limit.
+MAX_RESPONSE_BYTES = int(os.getenv("MAX_RESPONSE_BYTES", str(50 * 1024 * 1024)))
+
 # Delivery dates and decision cutoffs are GB (UK local) days. Settlement
 # dates in Elexon datasets follow the same convention.
 UK_TZ = ZoneInfo("Europe/London")
@@ -50,6 +64,65 @@ FORECAST_SOURCE = "Elexon BMRS WINDFOR (hourly wind generation forecast)"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("windwise")
+
+# Exit status 139 is SIGSEGV, a crash in native code that Python cannot
+# catch. faulthandler writes the Python stack of every thread to stderr
+# when that happens, so the platform logs show where the process died.
+faulthandler.enable()
+
+
+# ---------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------
+
+_request_id: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+_request_counter = itertools.count(1)
+
+
+def _memory_mb() -> tuple[float | None, float | None]:
+    """Current and peak resident memory in MB (Linux only, else None)."""
+
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            fields = dict(line.split(":", 1) for line in status if ":" in line)
+        return (
+            int(fields["VmRSS"].split()[0]) / 1024,
+            int(fields["VmHWM"].split()[0]) / 1024,
+        )
+    except (OSError, KeyError, ValueError):
+        return None, None
+
+
+def log_stage(stage: str, **details: Any) -> None:
+    """Log a processing stage with the request id and process memory.
+
+    If the process dies, the last stage logged for a request identifies
+    the step that was running.
+    """
+
+    rss, peak = _memory_mb()
+    logger.info(
+        "stage=%s request=%s pid=%s rss_mb=%s peak_rss_mb=%s %s",
+        stage,
+        _request_id.get(),
+        os.getpid(),
+        "n/a" if rss is None else f"{rss:.1f}",
+        "n/a" if peak is None else f"{peak:.1f}",
+        " ".join(f"{key}={value}" for key, value in details.items()),
+    )
+
+
+logger.info(
+    "Windwise process start: pid=%s python=%s platform=%s pandas=%s numpy=%s "
+    "httpx=%s uvloop_installed=%s",
+    os.getpid(),
+    platform.python_version(),
+    platform.platform(),
+    pd.__version__,
+    np.__version__,
+    httpx.__version__,
+    importlib.util.find_spec("uvloop") is not None,
+)
 
 app = FastAPI(
     title="Windwise API",
@@ -78,6 +151,31 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_request_lifecycle(request, call_next):
+    """Tag each request with an id and log when it starts and finishes."""
+
+    if request.url.path == "/health":
+        # Platform health checks run every few seconds; keep them quiet.
+        return await call_next(request)
+
+    _request_id.set(f"r{next(_request_counter)}")
+    started = perf_counter()
+    log_stage("request_start", method=request.method, path=request.url.path, query=request.url.query or "-")
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        log_stage("request_error", path=request.url.path, error=exc.__class__.__name__)
+        raise
+    log_stage(
+        "request_end",
+        path=request.url.path,
+        status=response.status_code,
+        ms=round((perf_counter() - started) * 1000),
+    )
+    return response
 
 
 class UpstreamDataError(ValueError):
@@ -182,7 +280,16 @@ def _rows(payload: Any) -> list[dict]:
 
 
 async def _fetch(path: str, params: dict) -> list[dict]:
-    """Fetch records from the Elexon Insights API (with a short TTL cache)."""
+    """Fetch records from the Elexon Insights API (with a short TTL cache).
+
+    A response body larger than ``MAX_RESPONSE_BYTES`` is rejected before
+    JSON-parsing.  Attempting to parse a multi-hundred-MB payload would cause
+    Python's C JSON decoder to allocate large contiguous objects; on
+    memory-constrained hosts that run with Linux overcommit the allocation
+    *succeeds* but the subsequent memory access raises SIGSEGV (exit 139)
+    rather than a catchable MemoryError.  Raising ``UpstreamDataError`` here
+    keeps the crash in Python-land and returns HTTP 502 to the caller.
+    """
 
     key = (path, tuple(sorted(params.items())))
     cached = _cache.get(key)
@@ -200,20 +307,32 @@ async def _fetch(path: str, params: dict) -> list[dict]:
             headers={"Accept": "application/json"},
         )
 
-    logger.info(
-        "Elexon response: endpoint=%s status=%s",
-        path,
-        response.status_code,
+    body_bytes = len(response.content)
+    log_stage(
+        "elexon_response",
+        endpoint=path,
+        status=response.status_code,
+        bytes=body_bytes,
     )
     response.raise_for_status()
 
+    if body_bytes > MAX_RESPONSE_BYTES:
+        raise UpstreamDataError(
+            f"{path} response is {body_bytes:,} bytes, which exceeds the "
+            f"{MAX_RESPONSE_BYTES:,}-byte safety limit. This prevents "
+            "unbounded memory allocation that causes SIGSEGV on memory-"
+            "constrained hosts. Raise MAX_RESPONSE_BYTES if this endpoint "
+            "legitimately returns more data."
+        )
+
+    log_stage("elexon_json_parse_start", endpoint=path, bytes=body_bytes)
     try:
         payload = response.json()
     except ValueError as exc:
         raise UpstreamDataError(f"{path} did not return valid JSON") from exc
 
     records = _rows(payload)
-    logger.info("Elexon response: endpoint=%s records=%s", path, len(records))
+    log_stage("elexon_parsed", endpoint=path, records=len(records))
 
     if CACHE_TTL_SECONDS > 0:
         _cache[key] = (monotonic() + CACHE_TTL_SECONDS, records)
@@ -274,6 +393,7 @@ async def fetch_actuals(
         return empty, notes
 
     df = pd.DataFrame(rows)
+    log_stage("actuals_dataframe", rows=len(df))
     _require_fields(df, {"fuelType", "startTime", "generation"}, "FUELHH")
 
     df = df[df["fuelType"].astype(str).str.strip().str.upper().eq("WIND")].copy()
@@ -335,7 +455,7 @@ async def fetch_actuals(
         .reset_index(drop=True)
     )
 
-    logger.info("Hourly actual WIND periods: %s", len(hourly))
+    log_stage("actuals_hourly", periods=len(hourly))
     return hourly[ACTUAL_COLUMNS], notes
 
 
@@ -386,8 +506,10 @@ async def fetch_forecasts(
         return empty, notes
 
     df = pd.DataFrame(rows)
+    log_stage("forecasts_dataframe", rows=len(df))
     _require_fields(df, {"startTime", "publishTime", "generation"}, "WINDFOR")
 
+    log_stage("forecasts_parse_timestamps", rows=len(df))
     df["startTime"] = pd.to_datetime(df["startTime"], utc=True, errors="coerce")
     df["publishTime"] = pd.to_datetime(df["publishTime"], utc=True, errors="coerce")
     df["forecast"] = pd.to_numeric(df["generation"], errors="coerce")
@@ -403,6 +525,7 @@ async def fetch_forecasts(
     # Never rely on the upstream filter alone for the no-look-ahead rule.
     df = df[df["publishTime"] <= publish_to]
     df = df[(df["startTime"] >= pd.Timestamp(start)) & (df["startTime"] < pd.Timestamp(end))]
+    log_stage("forecasts_window_filtered", rows=len(df))
 
     duplicated = df.duplicated(["startTime", "publishTime"], keep=False)
     if duplicated.any():
@@ -411,6 +534,7 @@ async def fetch_forecasts(
             "same period and publish time were collapsed to one."
         )
 
+    log_stage("forecasts_dedup_sort_start", rows=len(df))
     df = (
         df[FORECAST_COLUMNS]
         .drop_duplicates(subset=["startTime", "publishTime"], keep="last")
@@ -418,10 +542,10 @@ async def fetch_forecasts(
         .reset_index(drop=True)
     )
 
-    logger.info(
-        "WINDFOR records in window: %s across %s vintages",
-        len(df),
-        df["publishTime"].nunique(),
+    log_stage(
+        "forecasts_filtered",
+        records=len(df),
+        vintages=df["publishTime"].nunique(),
     )
     return df, notes
 
@@ -650,6 +774,12 @@ def build_analysis(
     else:
         table = actuals.reset_index(drop=True)
 
+    log_stage(
+        "analysis_merge_start",
+        actual_rows=len(actuals),
+        forecast_rows=len(forecasts),
+        table_rows=len(table),
+    )
     table["deliveryDate"] = [delivery_day_of(ts) for ts in table["startTime"]]
     cutoffs = {
         day: decision_cutoff(day, cutoff_hour, cutoff_minute)
@@ -660,8 +790,10 @@ def build_analysis(
     )
 
     # Latest vintage at or before each period's cutoff.
+    log_stage("analysis_candidates_merge_start", forecast_rows=len(forecasts), table_rows=len(table))
     candidates = forecasts.merge(table[["startTime", "cutoffTime"]], on="startTime")
     candidates = candidates[candidates["publishTime"] <= candidates["cutoffTime"]]
+    log_stage("analysis_candidates_filtered", candidates=len(candidates))
     chosen = (
         candidates.sort_values("publishTime")
         .drop_duplicates("startTime", keep="last")[FORECAST_COLUMNS]
@@ -826,6 +958,12 @@ async def _analyse_days(
 ) -> dict:
     start, _ = local_day_bounds(first_day)
     _, end = local_day_bounds(last_day)
+    log_stage(
+        "analysis_start",
+        first_day=first_day.isoformat(),
+        last_day=last_day.isoformat(),
+        cutoff=f"{cutoff_hour:02d}:{cutoff_minute:02d}",
+    )
 
     try:
         (actuals, actual_notes), (forecasts, forecast_notes) = await asyncio.gather(
@@ -860,6 +998,7 @@ async def _analyse_days(
             detail=f"Could not process Elexon response: {exc}",
         ) from exc
 
+    log_stage("fetch_complete", actual_periods=len(actuals), forecast_records=len(forecasts))
     result = build_analysis(
         actuals,
         forecasts,
@@ -869,6 +1008,7 @@ async def _analyse_days(
         period_end=end,
         notes=actual_notes + forecast_notes,
     )
+    log_stage("analysis_built", rows=len(result["rows"]), matched=result["coverage"]["matched"])
     result["period"] = {
         "first_delivery_date": first_day.isoformat(),
         "last_delivery_date": last_day.isoformat(),
