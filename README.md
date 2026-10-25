@@ -209,9 +209,9 @@ The fix:
 
 ## AI assistance disclosure
 
-AI tools were used in building this project. The initial scaffolding and documentation were AI-assisted. The January data-pipeline diagnosis and fix, the backend refactor, the dashboard features, the tests, the Docker and deployment configuration and this documentation were produced with **Claude Code (Anthropic)** working under the author's direction.
+ChatGPT (OpenAI) was used during development for planning the project, understanding concepts and implementation choices, troubleshooting, and obtaining or adapting selected code snippets. The author made the final implementation decisions, integrated the code, tested the application, and reviewed the resulting project.
 
-Verification was done by:
+Verification included:
 
 - checking Elexon's published OpenAPI specification and probing the live API;
 - running the automated test suites;
