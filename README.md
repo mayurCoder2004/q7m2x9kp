@@ -171,6 +171,12 @@ See [TESTING.md](TESTING.md) for coverage details and the manual smoke test.
 
 ## Deployment
 
+### Live application
+
+- **Dashboard:** https://wind-forecast-intelligence.vercel.app
+- **Backend health:** https://windwise-api.onrender.com/health
+- **API documentation:** https://windwise-api.onrender.com/docs
+
 The recommended setup is the **backend on Render** (Docker, `render.yaml` blueprint) and the **frontend on Vercel** (`frontend/vercel.json`).
 
 1. **Backend (Render):** New → Blueprint → select this repo. Render reads `render.yaml`, builds `backend/Dockerfile` and checks `/health`. Set `FRONTEND_ORIGINS` to the Vercel URL, e.g. `https://windwise.vercel.app`. The container listens on `$PORT`.
